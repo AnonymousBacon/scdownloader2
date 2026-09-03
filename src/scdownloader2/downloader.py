@@ -222,14 +222,22 @@ class SoundCloudFfmpegDownloader:
                 executor.submit(self.download_track, track, playlist_dir): track
                 for track in playlist.tracks
             }
-            for future in as_completed(future_to_track):
-                track = future_to_track[future]
-                filepath = future.result()
-                if filepath:
-                    downloaded_files.append(filepath)
-                else:
-                    failed_tracks.append(track.title)
-                time.sleep(random.uniform(min_delay, max_delay))
+            try:
+                for future in as_completed(future_to_track):
+                    track = future_to_track[future]
+                    filepath = future.result()
+                    if filepath:
+                        downloaded_files.append(filepath)
+                    else:
+                        failed_tracks.append(track.title)
+                    time.sleep(random.uniform(min_delay, max_delay))
+            except KeyboardInterrupt:
+                logger.warning(
+                    "Interrupted — letting in-flight downloads finish, "
+                    "skipping the rest..."
+                )
+                executor.shutdown(wait=True, cancel_futures=True)
+                raise
 
         logger.info(
             f"Download complete: {len(downloaded_files)}/{total_tracks} tracks downloaded"

@@ -62,10 +62,14 @@ def main() -> None:
     parser.add_argument("--zip", action="store_true", help="Zip the downloaded tracks (playlists only)")
     args = parser.parse_args()
 
-    if args.url:
-        run_noninteractive(args.url, Path(args.output), args.zip, args.proxy)
-    else:
-        run_interactive()
+    try:
+        if args.url:
+            run_noninteractive(args.url, Path(args.output), args.zip, args.proxy)
+        else:
+            run_interactive()
+    except KeyboardInterrupt:
+        logger.warning("Cancelled.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
