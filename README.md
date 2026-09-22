@@ -62,8 +62,45 @@ scdownloader2 --url "https://soundcloud.com/user/sets/playlist" --output downloa
 
 - `--url`: SoundCloud playlist or track URL
 - `--output`: Output directory (default: `output`)
+- `--refresh DIR`: Folder that already holds this playlist's songs — download only what's missing, straight into it
 - `--proxy`: Proxy URL, e.g. `http://proxy.example.com:8080`
 - `--zip`: Zip the downloaded tracks (playlists only)
+- `--overwrite`: Re-download tracks even if the file is already there
+- `--verify`: Check existing files are complete and re-download any that were cut off
+
+## Refreshing a playlist you already downloaded
+
+Downloads are incremental by default: a track is skipped when a file of the
+same name is already sitting in the target folder. So when tracks get added
+to a playlist, you just point the tool at your existing songs and it fetches
+only the new ones.
+
+```bash
+scdownloader2 --url "https://soundcloud.com/user/sets/playlist" --refresh ~/Music/my-playlist
+```
+
+`--refresh` downloads **into that exact folder** — it won't nest another
+`<playlist name>/` folder inside it. Re-running the plain `--output` form
+works too, since anything already downloaded there is skipped.
+
+In interactive mode there's nothing extra to do: if the folder you enter
+already contains mp3s, it's treated as a refresh of that folder
+automatically.
+
+Some details worth knowing:
+
+- Tracks are matched **by filename** (`Artist - Title.mp3`). If an artist
+  renames a track on SoundCloud, it no longer matches and downloads again
+  under the new name.
+- Downloads are written to a temporary `.part` file and renamed only once
+  ffmpeg finishes, so an interrupted run never leaves a half-file that a
+  later refresh would mistake for a complete download.
+- For files downloaded before that safeguard existed, `--verify` checks each
+  one against the length SoundCloud reports and re-downloads any that were
+  cut off. It decodes rather than trusting the MP3 header, because a
+  truncated MP3 still advertises the original duration.
+- `--zip` can't be combined with `--refresh`: zipping replaces the folder
+  with a `.zip`, which would remove the songs already in it.
 
 ## How it works
 

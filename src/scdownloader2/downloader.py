@@ -1,4 +1,5 @@
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,10 @@ from .utils import clean_filename, create_zip
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 
+# Downloads are encoded at a constant 192 kbps, so a finished file's size is
+# predictable from its duration. Used to spot truncated files cheaply.
+BYTES_PER_SECOND_AT_192K = 192_000 / 8
+
 
 @dataclass
 class Track:
@@ -25,6 +30,7 @@ class Track:
     permalink_url: str
     transcodings: List[Dict[str, Any]] = field(default_factory=list)
     policy: str = "ALLOW"
+    duration_ms: Optional[int] = None
 
 
 @dataclass
@@ -65,6 +71,7 @@ class SoundCloudFfmpegDownloader:
             permalink_url=data["permalink_url"],
             transcodings=media.get("transcodings", []),
             policy=data.get("policy", "ALLOW"),
+            duration_ms=data.get("full_duration") or data.get("duration"),
         )
 
     def _select_transcoding(self, track: Track) -> Optional[Dict[str, Any]]:
@@ -132,6 +139,69 @@ class SoundCloudFfmpegDownloader:
 
         return Playlist(id=data["id"], title=data["title"], tracks=tracks)
 
+    # -- "do we already have it?" ----------------------------------------
+
+    def _expected_filename(self, track: Track) -> str:
+        """The filename a track downloads to. Single source of truth, so the
+        skip-if-present check can never drift from what downloads actually write."""
+        return clean_filename(f"{track.artist} - {track.title}") + ".mp3"
+
+    def _decoded_duration(self, path: Path) -> Optional[float]:
+        """How much audio `path` actually contains, in seconds.
+
+        Deliberately decodes the file instead of reading its header: a
+        truncated MP3 still advertises the *original* duration in its header,
+        so only decoding reveals that the audio was cut short.
+        """
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-f", "null", "-"],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+        matches = re.findall(r"time=(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", result.stderr or "")
+        if not matches:
+            return None
+        hours, minutes, seconds = matches[-1]
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    def _file_is_complete(self, path: Path, track: Track) -> bool:
+        """True if `path` looks like a complete copy of `track`."""
+        if not track.duration_ms:
+            return True  # nothing to compare against; assume it's fine
+        expected_seconds = track.duration_ms / 1000
+
+        # Cheap screen first: a cut-off file is dramatically smaller than a
+        # whole one, and this costs nothing for the files that are fine.
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        if size >= 0.85 * expected_seconds * BYTES_PER_SECOND_AT_192K:
+            return True
+
+        # It looks short, but it might just have been encoded at a lower
+        # bitrate elsewhere — so confirm by actually decoding it before
+        # deciding to replace someone's file.
+        actual = self._decoded_duration(path)
+        if actual is None:
+            return False  # unreadable/corrupt
+        return abs(actual - expected_seconds) <= 2.0
+
+    def _existing_filenames(self, directory: Path) -> set:
+        """Names of non-empty files already in `directory`."""
+        if not directory.exists():
+            return set()
+        return {
+            p.name
+            for p in directory.iterdir()
+            if p.is_file() and p.stat().st_size > 0
+        }
+
     # -- downloading ----------------------------------------------------
 
     def _ffmpeg_command(self, stream_url: str, track: Track, output_path: Path) -> List[str]:
@@ -148,6 +218,9 @@ class SoundCloudFfmpegDownloader:
             "-b:a", "192k",
             "-metadata", f"title={track.title}",
             "-metadata", f"artist={track.artist}",
+            # Explicit, because downloads are written to a ".part" file whose
+            # extension ffmpeg can't infer a format from.
+            "-f", "mp3",
             str(output_path),
         ]
         return cmd
@@ -168,25 +241,43 @@ class SoundCloudFfmpegDownloader:
             logger.error(f"Could not resolve stream for '{track.title}': {e}")
             return None
 
-        filename = clean_filename(f"{track.artist} - {track.title}") + ".mp3"
-        output_path = Path(output_dir) / filename
-        cmd = self._ffmpeg_command(stream_url, track, output_path)
+        output_path = Path(output_dir) / self._expected_filename(track)
+        # Download to a scratch file and rename only on success, so an
+        # interrupted or failed run never leaves a truncated file sitting
+        # there looking like a finished download.
+        part_path = output_path.parent / (output_path.name + ".part")
+        cmd = self._ffmpeg_command(stream_url, track, part_path)
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         except subprocess.TimeoutExpired:
             logger.error(f"Timed out downloading '{track.title}'")
+            part_path.unlink(missing_ok=True)
             return None
 
-        if result.returncode != 0 or not output_path.exists():
+        if result.returncode != 0 or not part_path.exists():
             stderr_tail = result.stderr.strip()[-500:] if result.stderr else "no output"
             logger.error(f"ffmpeg failed for '{track.title}': {stderr_tail}")
+            part_path.unlink(missing_ok=True)
+            return None
+
+        try:
+            part_path.replace(output_path)
+        except OSError as e:
+            logger.error(f"Could not finalize '{track.title}': {e}")
+            part_path.unlink(missing_ok=True)
             return None
 
         logger.info(f"Successfully downloaded: {output_path}")
         return output_path
 
-    def download_single_track(self, track_url: str, output_dir: Path) -> Optional[Path]:
+    def download_single_track(
+        self,
+        track_url: str,
+        output_dir: Path,
+        overwrite: bool = False,
+        verify: bool = False,
+    ) -> Optional[Path]:
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         data = self.api.resolve(track_url)
@@ -194,6 +285,14 @@ class SoundCloudFfmpegDownloader:
         if track is None:
             logger.error("That URL does not resolve to a single SoundCloud track.")
             return None
+
+        existing = output_dir / self._expected_filename(track)
+        if not overwrite and existing.is_file() and existing.stat().st_size > 0:
+            if not verify or self._file_is_complete(existing, track):
+                logger.success(f"Already downloaded: {existing}")
+                return existing
+            logger.warning(f"Existing file looks incomplete, re-downloading: {existing.name}")
+
         return self.download_track(track, output_dir)
 
     def download_playlist(
@@ -204,23 +303,83 @@ class SoundCloudFfmpegDownloader:
         min_delay: int = 3,
         max_delay: int = 10,
         should_zip: bool = False,
+        target_dir: Optional[Path] = None,
+        overwrite: bool = False,
+        verify: bool = False,
     ) -> Optional[Path]:
-        output_dir = Path(output_dir).resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
+        """Download a playlist, skipping tracks already present on disk.
+
+        Args:
+            target_dir: "Refresh" mode — a folder that already holds this
+                playlist's songs. Tracks download straight into it, with no
+                `<playlist name>/` subfolder created. When omitted, the usual
+                `output_dir/<playlist name>/` layout is used.
+            overwrite: Re-download tracks even when the file already exists.
+            verify: Check existing files against SoundCloud's reported track
+                length and re-download any that are truncated.
+        """
+        if should_zip and target_dir is not None:
+            raise ValueError(
+                "Refusing to zip while refreshing an existing folder: zipping "
+                "replaces the folder with a .zip, which would remove the songs "
+                "already in it."
+            )
+
+        if target_dir is not None:
+            playlist_dir = Path(target_dir).resolve()
+            if not playlist_dir.exists():
+                logger.warning(
+                    f"Refresh folder does not exist yet: {playlist_dir} — "
+                    "creating it and downloading the whole playlist."
+                )
+            playlist_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            output_dir = Path(output_dir).resolve()
+            output_dir.mkdir(parents=True, exist_ok=True)
 
         playlist = self.get_playlist_info(playlist_url)
         playlist_name = clean_filename(playlist.title)
-        playlist_dir = output_dir / playlist_name
-        playlist_dir.mkdir(exist_ok=True)
+        if target_dir is None:
+            playlist_dir = output_dir / playlist_name
+            playlist_dir.mkdir(exist_ok=True)
+
+        total_tracks = len(playlist.tracks)
+
+        # Work out what's already on disk before downloading anything.
+        existing_names = set() if overwrite else self._existing_filenames(playlist_dir)
+        pending: List[Track] = []
+        already_have: List[Track] = []
+        for track in playlist.tracks:
+            if self._expected_filename(track) not in existing_names:
+                pending.append(track)
+                continue
+            path = playlist_dir / self._expected_filename(track)
+            if verify and not self._file_is_complete(path, track):
+                logger.warning(f"Existing file looks incomplete, re-downloading: {path.name}")
+                pending.append(track)
+            else:
+                already_have.append(track)
+
+        if already_have:
+            logger.info(
+                f"Found {len(already_have)} of {total_tracks} track(s) already in "
+                f"{playlist_dir} — skipping those."
+            )
+        if not pending:
+            logger.success(
+                f"Already up to date: all {total_tracks} track(s) are in {playlist_dir}."
+            )
+            return playlist_dir
+
+        logger.info(f"Downloading {len(pending)} new track(s)...")
 
         downloaded_files: List[Path] = []
         failed_tracks: List[str] = []
-        total_tracks = len(playlist.tracks)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_track = {
                 executor.submit(self.download_track, track, playlist_dir): track
-                for track in playlist.tracks
+                for track in pending
             }
             try:
                 for future in as_completed(future_to_track):
@@ -240,7 +399,9 @@ class SoundCloudFfmpegDownloader:
                 raise
 
         logger.info(
-            f"Download complete: {len(downloaded_files)}/{total_tracks} tracks downloaded"
+            f"Download complete: {len(downloaded_files)} new, "
+            f"{len(already_have)} already had, {len(failed_tracks)} failed "
+            f"(of {total_tracks} track(s))"
         )
         if failed_tracks:
             logger.warning(
@@ -249,15 +410,19 @@ class SoundCloudFfmpegDownloader:
             if len(failed_tracks) > 5:
                 logger.warning(f"... and {len(failed_tracks) - 5} more")
 
-        if not downloaded_files:
+        if not downloaded_files and not already_have:
             logger.error("No files were successfully downloaded.")
             return None
 
         if should_zip:
-            zip_filename = output_dir / f"{playlist_name}.zip"
-            create_zip(downloaded_files, zip_filename, playlist_dir)
-            for f in downloaded_files:
-                f.unlink()
+            # Zip everything in the folder, not just this run's downloads —
+            # the folder is deleted afterwards, so anything left out would be lost.
+            all_files = sorted(
+                p for p in playlist_dir.iterdir()
+                if p.is_file() and p.suffix.lower() == ".mp3"
+            )
+            zip_filename = playlist_dir.parent / f"{playlist_name}.zip"
+            create_zip(all_files, zip_filename, playlist_dir)
             shutil.rmtree(playlist_dir)
             return zip_filename
 
@@ -269,14 +434,28 @@ class SoundCloudFfmpegDownloader:
         output_dir: Path,
         max_workers: int = 3,
         should_zip: bool = False,
+        target_dir: Optional[Path] = None,
+        overwrite: bool = False,
+        verify: bool = False,
     ) -> Optional[Path]:
         """Download `url`, auto-detecting whether it's a track or a playlist."""
         kind = self.api.resolve(url).get("kind")
         if kind == "playlist":
             return self.download_playlist(
-                url, output_dir, max_workers=max_workers, should_zip=should_zip
+                url,
+                output_dir,
+                max_workers=max_workers,
+                should_zip=should_zip,
+                target_dir=target_dir,
+                overwrite=overwrite,
+                verify=verify,
             )
         if kind == "track":
-            return self.download_single_track(url, output_dir)
+            return self.download_single_track(
+                url,
+                target_dir if target_dir is not None else output_dir,
+                overwrite=overwrite,
+                verify=verify,
+            )
         logger.error(f"Unsupported SoundCloud URL (resolved kind: {kind!r}).")
         return None
