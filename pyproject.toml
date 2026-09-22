@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scdownloader2"
-version = "0.2.0"
-description = "Download SoundCloud tracks/playlists as MP3, via the SoundCloud API and ffmpeg directly."
+version = "0.3.0"
+description = "Download SoundCloud tracks/playlists as MP3 or M4A, via the SoundCloud API and ffmpeg directly."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "GPL-3.0-or-later" }

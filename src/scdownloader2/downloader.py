@@ -17,9 +17,28 @@ from .utils import clean_filename, create_zip
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 
-# Downloads are encoded at a constant 192 kbps, so a finished file's size is
-# predictable from its duration. Used to spot truncated files cheaply.
-BYTES_PER_SECOND_AT_192K = 192_000 / 8
+AUDIO_FORMATS = ("mp3", "m4a")
+
+
+def _source_kbps(transcoding: Dict[str, Any]) -> int:
+    """Rough bitrate of a SoundCloud transcoding, from its preset name.
+
+    Presets look like "aac_160k", "aac_96k", "mp3_1_0" (128 kbps MP3) or
+    "opus_0_0" (64 kbps Opus). Unknown ones rank last.
+    """
+    preset = transcoding.get("preset", "")
+    match = re.search(r"(\d+)k", preset)
+    if match:
+        return int(match.group(1))
+    if preset.startswith("mp3"):
+        return 128
+    if preset.startswith("opus"):
+        return 64
+    return 0
+
+
+def _is_aac(transcoding: Dict[str, Any]) -> bool:
+    return "mp4a" in transcoding.get("format", {}).get("mime_type", "")
 
 
 @dataclass
@@ -44,18 +63,33 @@ class SoundCloudFfmpegDownloader:
     """
     Downloads tracks/playlists from SoundCloud by talking to SoundCloud's
     current API (api-v2.soundcloud.com) directly and handing the resulting
-    stream URL straight to `ffmpeg`, which does the fetching and the MP3
-    transcoding in one shot (ffmpeg natively speaks both the plain
-    progressive-mp3 URLs and the HLS/m3u8 URLs SoundCloud serves).
+    stream URL straight to `ffmpeg`, which does the fetching and the
+    encoding in one shot (ffmpeg natively speaks both the plain progressive
+    URLs and the HLS/m3u8 URLs SoundCloud serves).
     """
 
-    def __init__(self, proxy: Optional[str] = None):
+    def __init__(
+        self,
+        proxy: Optional[str] = None,
+        audio_format: str = "mp3",
+        bitrate: int = 320,
+    ):
+        """
+        Args:
+            audio_format: "mp3" re-encodes to MP3 at `bitrate`. "m4a" keeps
+                SoundCloud's AAC stream exactly as served, with no re-encode.
+            bitrate: MP3 bitrate in kbps. Ignored for m4a.
+        """
         if not shutil.which("ffmpeg"):
             raise RuntimeError(
                 "ffmpeg was not found on PATH. Install it first, e.g. "
                 "`brew install ffmpeg` (macOS) or `sudo apt-get install ffmpeg` (Linux)."
             )
+        if audio_format not in AUDIO_FORMATS:
+            raise ValueError(f"audio_format must be one of {AUDIO_FORMATS}")
         self.proxy = proxy
+        self.audio_format = audio_format
+        self.bitrate = bitrate
         self.api = SoundCloudAPI(proxy=proxy)
 
     # -- metadata -----------------------------------------------------
@@ -88,25 +122,15 @@ class SoundCloudFfmpegDownloader:
         if not candidates:
             return None
 
-        def is_mp3(t: Dict[str, Any]) -> bool:
-            # Exact match: "audio/mpegurl" (an HLS playlist mime type) also
-            # starts with "audio/mpeg", so a substring/prefix check here
-            # would wrongly treat an HLS index as a plain MP3 stream.
-            return t.get("format", {}).get("mime_type") == "audio/mpeg"
+        # Take the highest-quality source. For free streams that's usually
+        # aac_160k (AAC at 160 kbps, what SoundCloud's own web player uses),
+        # which beats mp3_1_0 (MP3 at 128 kbps). Progressive breaks ties since
+        # it's a single request rather than hundreds of HLS segments.
+        def rank(t: Dict[str, Any]):
+            is_progressive = t.get("format", {}).get("protocol") == "progressive"
+            return (_source_kbps(t), is_progressive)
 
-        def is_progressive(t: Dict[str, Any]) -> bool:
-            return t.get("format", {}).get("protocol") == "progressive"
-
-        for pred in (
-            lambda t: is_progressive(t) and is_mp3(t),
-            is_progressive,
-            is_mp3,
-            lambda t: True,
-        ):
-            match = next((t for t in candidates if pred(t)), None)
-            if match:
-                return match
-        return None
+        return max(candidates, key=rank)
 
     def get_playlist_info(self, playlist_url: str) -> Playlist:
         data = self.api.resolve(playlist_url)
@@ -144,7 +168,29 @@ class SoundCloudFfmpegDownloader:
     def _expected_filename(self, track: Track) -> str:
         """The filename a track downloads to. Single source of truth, so the
         skip-if-present check can never drift from what downloads actually write."""
-        return clean_filename(f"{track.artist} - {track.title}") + ".mp3"
+        return clean_filename(f"{track.artist} - {track.title}") + f".{self.audio_format}"
+
+    def _nominal_kbps(self, path: Path) -> Optional[float]:
+        """The bitrate a file was encoded at, read from its header (no decoding).
+
+        Unlike duration, the header's bitrate stays accurate in a truncated
+        file, so size / bitrate tells us how much audio is really there.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=bit_rate",
+                    "-of", "default=nokey=1:noprint_wrappers=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return float(result.stdout.strip()) / 1000
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return None
 
     def _decoded_duration(self, path: Path) -> Optional[float]:
         """How much audio `path` actually contains, in seconds.
@@ -175,18 +221,19 @@ class SoundCloudFfmpegDownloader:
             return True  # nothing to compare against; assume it's fine
         expected_seconds = track.duration_ms / 1000
 
-        # Cheap screen first: a cut-off file is dramatically smaller than a
-        # whole one, and this costs nothing for the files that are fine.
+        # Cheap screen first: at the file's own encoded bitrate, a complete
+        # file's size is predictable from the track length, and a cut-off
+        # one falls well short.
         try:
             size = path.stat().st_size
         except OSError:
             return False
-        if size >= 0.85 * expected_seconds * BYTES_PER_SECOND_AT_192K:
+        kbps = self._nominal_kbps(path)
+        if kbps and size >= 0.9 * expected_seconds * kbps * 1000 / 8:
             return True
 
-        # It looks short, but it might just have been encoded at a lower
-        # bitrate elsewhere — so confirm by actually decoding it before
-        # deciding to replace someone's file.
+        # Looks short or the header is unreadable — confirm by actually
+        # decoding it before deciding to replace someone's file.
         actual = self._decoded_duration(path)
         if actual is None:
             return False  # unreadable/corrupt
@@ -204,7 +251,23 @@ class SoundCloudFfmpegDownloader:
 
     # -- downloading ----------------------------------------------------
 
-    def _ffmpeg_command(self, stream_url: str, track: Track, output_path: Path) -> List[str]:
+    def _codec_args(self, transcoding: Dict[str, Any]) -> List[str]:
+        if self.audio_format == "m4a":
+            if _is_aac(transcoding):
+                # Keep SoundCloud's AAC bit-for-bit: no re-encode, no loss.
+                return ["-c:a", "copy", "-f", "ipod"]
+            return ["-c:a", "aac", "-b:a", "256k", "-f", "ipod"]
+        # The container format is explicit because downloads are written to a
+        # ".part" file whose extension ffmpeg can't infer a format from.
+        return ["-c:a", "libmp3lame", "-b:a", f"{self.bitrate}k", "-f", "mp3"]
+
+    def _ffmpeg_command(
+        self,
+        stream_url: str,
+        track: Track,
+        transcoding: Dict[str, Any],
+        output_path: Path,
+    ) -> List[str]:
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
         if self.proxy:
             cmd += ["-http_proxy", self.proxy]
@@ -214,13 +277,9 @@ class SoundCloudFfmpegDownloader:
             "-i", stream_url,
             "-vn",
             "-map_metadata", "-1",
-            "-acodec", "libmp3lame",
-            "-b:a", "192k",
             "-metadata", f"title={track.title}",
             "-metadata", f"artist={track.artist}",
-            # Explicit, because downloads are written to a ".part" file whose
-            # extension ffmpeg can't infer a format from.
-            "-f", "mp3",
+            *self._codec_args(transcoding),
             str(output_path),
         ]
         return cmd
@@ -246,7 +305,7 @@ class SoundCloudFfmpegDownloader:
         # interrupted or failed run never leaves a truncated file sitting
         # there looking like a finished download.
         part_path = output_path.parent / (output_path.name + ".part")
-        cmd = self._ffmpeg_command(stream_url, track, part_path)
+        cmd = self._ffmpeg_command(stream_url, track, transcoding, part_path)
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -347,6 +406,16 @@ class SoundCloudFfmpegDownloader:
 
         # Work out what's already on disk before downloading anything.
         existing_names = set() if overwrite else self._existing_filenames(playlist_dir)
+
+        other_formats = {
+            Path(n).suffix.lower() for n in existing_names
+        } & {f".{fmt}" for fmt in AUDIO_FORMATS if fmt != self.audio_format}
+        if other_formats:
+            logger.warning(
+                f"{playlist_dir} has {', '.join(sorted(other_formats))} files, but you're "
+                f"downloading .{self.audio_format}. Those won't count as already "
+                f"downloaded, so matching tracks will be fetched again as .{self.audio_format}."
+            )
         pending: List[Track] = []
         already_have: List[Track] = []
         for track in playlist.tracks:
@@ -419,7 +488,7 @@ class SoundCloudFfmpegDownloader:
             # the folder is deleted afterwards, so anything left out would be lost.
             all_files = sorted(
                 p for p in playlist_dir.iterdir()
-                if p.is_file() and p.suffix.lower() == ".mp3"
+                if p.is_file() and p.suffix.lower() == f".{self.audio_format}"
             )
             zip_filename = playlist_dir.parent / f"{playlist_name}.zip"
             create_zip(all_files, zip_filename, playlist_dir)
